@@ -18,10 +18,21 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
+
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-ABOUT_CONTACT = os.getenv("ABOUT_CONTACT", "")  # masalan: @admin_username
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+ADMINS = ADMIN_IDS
+
+ABOUT_CONTACT = os.getenv("ABOUT_CONTACT", "").strip()
+
 DB_PATH = "library.db"
 PAGE_SIZE = 8
 

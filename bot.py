@@ -2,23 +2,47 @@ import asyncio
 import logging
 import os
 import sqlite3
+from contextlib import closing
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+ABOUT_CONTACT = os.getenv("ABOUT_CONTACT", "")  # masalan: @admin_username
 DB_PATH = "library.db"
 PAGE_SIZE = 8
 
 LANGS = {"uz": "🇺🇿 O'zbekcha", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
+LANG_PROMPT = "🌐 Tilni tanlang / Выберите язык / Choose language:"
+
+# Pastki (doimiy) menyu tugmalari
+BTN = {
+    "uz": {"books": "📚 Kitoblar", "search": "🔍 Kitob qidirish", "about": "ℹ️ Bot haqida",
+           "lang": "🌐 Til", "admin": "⚙️ Admin panel"},
+    "ru": {"books": "📚 Книги", "search": "🔍 Поиск книги", "about": "ℹ️ О боте",
+           "lang": "🌐 Язык", "admin": "⚙️ Админ панель"},
+    "en": {"books": "📚 Books", "search": "🔍 Search book", "about": "ℹ️ About bot",
+           "lang": "🌐 Language", "admin": "⚙️ Admin panel"},
+}
+
+
+def btn_set(key):
+    """Barcha tillardagi shu tugma matnlari (handlerlarda filtr uchun)."""
+    return {BTN[l][key] for l in BTN}
+
 
 TEXTS = {
     "uz": {
@@ -30,6 +54,14 @@ TEXTS = {
         "next": "▶️",
         "lang_set": "✅ Til tanlandi: {lang}",
         "author": "Muallif",
+        "menu_ready": "Asosiy menyu pastda 👇",
+        "search_ask": "🔍 Kitob nomi yoki muallifini yozing:",
+        "search_none": "😕 Hech narsa topilmadi. Boshqa so'z bilan urinib ko'ring.",
+        "search_found": "🔎 Topilgan kitoblar:",
+        "about": "ℹ️ <b>Kutubxona boti</b>\n\nBu yerda kitoblarni kategoriya bo'yicha ko'rish, "
+                 "nom yoki muallif bo'yicha qidirish va fayl ko'rinishida yuklab olish mumkin.\n"
+                 "Tillar: O'zbekcha, Русский, English.",
+        "contact": "Aloqa",
     },
     "ru": {
         "welcome": "📚 Добро пожаловать в библиотеку!\nВыберите категорию:",
@@ -40,6 +72,14 @@ TEXTS = {
         "next": "▶️",
         "lang_set": "✅ Язык выбран: {lang}",
         "author": "Автор",
+        "menu_ready": "Главное меню внизу 👇",
+        "search_ask": "🔍 Напишите название книги или автора:",
+        "search_none": "😕 Ничего не найдено. Попробуйте другое слово.",
+        "search_found": "🔎 Найденные книги:",
+        "about": "ℹ️ <b>Бот-библиотека</b>\n\nЗдесь можно смотреть книги по категориям, "
+                 "искать по названию или автору и скачивать файлом.\n"
+                 "Языки: O'zbekcha, Русский, English.",
+        "contact": "Контакт",
     },
     "en": {
         "welcome": "📚 Welcome to the library!\nChoose a category:",
@@ -50,13 +90,24 @@ TEXTS = {
         "next": "▶️",
         "lang_set": "✅ Language selected: {lang}",
         "author": "Author",
+        "menu_ready": "Main menu is below 👇",
+        "search_ask": "🔍 Type a book title or author:",
+        "search_none": "😕 Nothing found. Try another word.",
+        "search_found": "🔎 Books found:",
+        "about": "ℹ️ <b>Library bot</b>\n\nBrowse books by category, search by title or author "
+                 "and download them as files.\n"
+                 "Languages: O'zbekcha, Русский, English.",
+        "contact": "Contact",
     },
 }
 
+
 # ---------------------------------------------------------------- DB
 def q(sql, args=(), one=False, commit=False):
-    with sqlite3.connect(DB_PATH) as con:
+    with closing(sqlite3.connect(DB_PATH)) as con:
         con.row_factory = sqlite3.Row
+        # Kirill harflarida ham katta-kichik harfga bog'liq bo'lmagan qidiruv uchun
+        con.create_function("pylower", 1, lambda s: s.lower() if s else "")
         cur = con.execute(sql, args)
         if commit:
             con.commit()
@@ -100,6 +151,17 @@ def lang_kb(prefix="lang"):
     return kb.as_markup()
 
 
+def main_menu_kb(lang, uid):
+    b = BTN[lang]
+    rows = [
+        [KeyboardButton(text=b["books"]), KeyboardButton(text=b["search"])],
+        [KeyboardButton(text=b["about"]), KeyboardButton(text=b["lang"])],
+    ]
+    if uid in ADMINS:
+        rows.append([KeyboardButton(text=b["admin"])])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
 def categories_kb(lang):
     rows = q(
         """SELECT c.id, c.name, COUNT(b.id) AS n FROM categories c
@@ -120,6 +182,10 @@ def categories_kb(lang):
 user = Router()
 
 
+class SearchState(StatesGroup):
+    query = State()
+
+
 async def show_menu(target, lang, edit=False):
     t = TEXTS[lang]
     kb = categories_kb(lang)
@@ -130,15 +196,24 @@ async def show_menu(target, lang, edit=False):
         await target.answer(text, reply_markup=kb)
 
 
+async def ask_language(m: Message):
+    await m.answer(LANG_PROMPT, reply_markup=lang_kb())
+
+
 @user.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("🌐 Tilni tanlang / Выберите язык / Choose language:", reply_markup=lang_kb())
+    lang = get_lang(m.from_user.id)
+    if not lang:
+        return await ask_language(m)
+    await m.answer(TEXTS[lang]["menu_ready"], reply_markup=main_menu_kb(lang, m.from_user.id))
+    await show_menu(m, lang)
 
 
 @user.message(Command("language"))
-async def change_lang(m: Message):
-    await m.answer("🌐 Tilni tanlang / Выберите язык / Choose language:", reply_markup=lang_kb())
+async def change_lang(m: Message, state: FSMContext):
+    await state.clear()
+    await ask_language(m)
 
 
 @user.callback_query(F.data.startswith("lang:"))
@@ -148,15 +223,75 @@ async def cb_lang(cb: CallbackQuery):
         return await cb.answer()
     set_lang(cb.from_user.id, lang)
     await cb.message.edit_text(TEXTS[lang]["lang_set"].format(lang=LANGS[lang]))
+    # Pastki doimiy menyuni shu yerda yuboramiz
+    await cb.message.answer(TEXTS[lang]["menu_ready"], reply_markup=main_menu_kb(lang, cb.from_user.id))
     await show_menu(cb.message, lang)
     await cb.answer()
 
 
+# ---- Pastki menyu tugmalari
+@user.message(F.text.in_(btn_set("books")))
+async def menu_books(m: Message, state: FSMContext):
+    await state.clear()
+    lang = get_lang(m.from_user.id)
+    if not lang:
+        return await ask_language(m)
+    await show_menu(m, lang)
+
+
+@user.message(F.text.in_(btn_set("search")))
+async def menu_search(m: Message, state: FSMContext):
+    lang = get_lang(m.from_user.id)
+    if not lang:
+        return await ask_language(m)
+    await state.set_state(SearchState.query)
+    await m.answer(TEXTS[lang]["search_ask"])
+
+
+@user.message(F.text.in_(btn_set("about")))
+async def menu_about(m: Message, state: FSMContext):
+    await state.clear()
+    lang = get_lang(m.from_user.id) or "uz"
+    text = TEXTS[lang]["about"]
+    if ABOUT_CONTACT:
+        text += f"\n\n{TEXTS[lang]['contact']}: {ABOUT_CONTACT}"
+    await m.answer(text, parse_mode="HTML")
+
+
+@user.message(F.text.in_(btn_set("lang")))
+async def menu_lang(m: Message, state: FSMContext):
+    await state.clear()
+    await ask_language(m)
+
+
+@user.message(SearchState.query, F.text, ~F.text.startswith("/"))
+async def do_search(m: Message, state: FSMContext):
+    lang = get_lang(m.from_user.id) or "uz"
+    t = TEXTS[lang]
+    term = f"%{m.text.strip().lower()}%"
+    rows = q(
+        """SELECT id, title, author FROM books
+           WHERE lang=? AND (pylower(title) LIKE ? OR pylower(author) LIKE ?)
+           ORDER BY title LIMIT 20""",
+        (lang, term, term),
+    )
+    await state.clear()
+    if not rows:
+        return await m.answer(t["search_none"])
+    kb = InlineKeyboardBuilder()
+    for b in rows:
+        label = b["title"] + (f" — {b['author']}" if b["author"] else "")
+        kb.button(text=label[:60], callback_data=f"book:{b['id']}")
+    kb.adjust(1)
+    await m.answer(t["search_found"], reply_markup=kb.as_markup())
+
+
+# ---- Kategoriya / kitob
 @user.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery):
     lang = get_lang(cb.from_user.id)
     if not lang:
-        await cb.message.edit_text("🌐 Tilni tanlang / Выберите язык / Choose language:", reply_markup=lang_kb())
+        await cb.message.edit_text(LANG_PROMPT, reply_markup=lang_kb())
     else:
         await show_menu(cb.message, lang, edit=True)
     await cb.answer()
@@ -166,7 +301,7 @@ async def cb_menu(cb: CallbackQuery):
 async def cb_category(cb: CallbackQuery):
     lang = get_lang(cb.from_user.id)
     if not lang:
-        await cb.message.edit_text("🌐 Tilni tanlang / Выберите язык / Choose language:", reply_markup=lang_kb())
+        await cb.message.edit_text(LANG_PROMPT, reply_markup=lang_kb())
         return await cb.answer()
     t = TEXTS[lang]
     _, cid, page = cb.data.split(":")
@@ -232,25 +367,106 @@ class AddBook(StatesGroup):
     file = State()
 
 
+class AddCategory(StatesGroup):
+    name = State()
+
+
+def admin_panel_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Kitob qo'shish", callback_data="adm:addbook")
+    kb.button(text="📂 Kategoriya qo'shish", callback_data="adm:addcat")
+    kb.button(text="📚 Kitoblar ro'yxati", callback_data="adm:books")
+    kb.button(text="🗂 Kategoriyalar", callback_data="adm:cats")
+    kb.button(text="📊 Statistika", callback_data="adm:stats")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+ADMIN_HELP = (
+    "⚙️ <b>Admin panel</b>\n\n"
+    "O'chirish buyruqlari:\n"
+    "/delbook ID — kitobni o'chirish\n"
+    "/delcategory ID — kategoriyani o'chirish (ichida kitob bo'lmasa)\n"
+    "/cancel — joriy amalni bekor qilish"
+)
+
+
+def books_text():
+    rows = q("SELECT id, title, lang FROM books ORDER BY id DESC LIMIT 50")
+    if not rows:
+        return "Kitoblar yo'q."
+    return "\n".join(f"{r['id']}. [{r['lang']}] {r['title']}" for r in rows)
+
+
+def categories_text():
+    rows = q("SELECT id, name FROM categories ORDER BY id")
+    if not rows:
+        return "Kategoriyalar yo'q."
+    return "\n".join(f"{r['id']}. {r['name']}" for r in rows)
+
+
+def stats_text():
+    users = q("SELECT COUNT(*) AS n FROM users", one=True)["n"]
+    books = q("SELECT COUNT(*) AS n FROM books", one=True)["n"]
+    cats = q("SELECT COUNT(*) AS n FROM categories", one=True)["n"]
+    return f"📊 Foydalanuvchilar: {users}\n📚 Kitoblar: {books}\n📂 Kategoriyalar: {cats}"
+
+
+@admin.message(Command("cancel"))
+async def cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Bekor qilindi.")
+
+
 @admin.message(Command("admin"))
-async def admin_help(m: Message):
-    await m.answer(
-        "🔧 Admin buyruqlari:\n\n"
-        "/addcategory Nomi — kategoriya qo'shish\n"
-        "/categories — kategoriyalar ro'yxati\n"
-        "/delcategory ID — kategoriyani o'chirish (ichida kitob bo'lmasa)\n"
-        "/addbook — kitob qo'shish\n"
-        "/books — kitoblar ro'yxati\n"
-        "/delbook ID — kitobni o'chirish\n"
-        "/cancel — bekor qilish"
-    )
+@admin.message(F.text.in_(btn_set("admin")))
+async def admin_panel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(ADMIN_HELP, reply_markup=admin_panel_kb(), parse_mode="HTML")
 
 
+# ---- Panel tugmalari
+@admin.callback_query(F.data == "adm:books")
+async def adm_books(cb: CallbackQuery):
+    await cb.message.answer(books_text())
+    await cb.answer()
+
+
+@admin.callback_query(F.data == "adm:cats")
+async def adm_cats(cb: CallbackQuery):
+    await cb.message.answer(categories_text())
+    await cb.answer()
+
+
+@admin.callback_query(F.data == "adm:stats")
+async def adm_stats(cb: CallbackQuery):
+    await cb.message.answer(stats_text())
+    await cb.answer()
+
+
+@admin.callback_query(F.data == "adm:addcat")
+async def adm_addcat(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddCategory.name)
+    await cb.message.answer("📂 Yangi kategoriya nomini yuboring:")
+    await cb.answer()
+
+
+@admin.callback_query(F.data == "adm:addbook")
+async def adm_addbook(cb: CallbackQuery, state: FSMContext):
+    await begin_addbook(cb.message, state)
+    await cb.answer()
+
+
+# ---- Buyruqlar (eskisi kabi ishlayveradi)
 @admin.message(Command("addcategory"))
 async def add_category(m: Message):
     name = (m.text or "").partition(" ")[2].strip()
     if not name:
         return await m.answer("Foydalanish: /addcategory Badiiy adabiyot")
+    await save_category(m, name)
+
+
+async def save_category(m: Message, name: str):
     try:
         q("INSERT INTO categories (name) VALUES (?)", (name,), commit=True)
     except sqlite3.IntegrityError:
@@ -258,12 +474,15 @@ async def add_category(m: Message):
     await m.answer(f"✅ Kategoriya qo'shildi: {name}")
 
 
+@admin.message(AddCategory.name, F.text, ~F.text.startswith("/"))
+async def ac_name(m: Message, state: FSMContext):
+    await state.clear()
+    await save_category(m, m.text.strip())
+
+
 @admin.message(Command("categories"))
 async def list_categories(m: Message):
-    rows = q("SELECT id, name FROM categories ORDER BY id")
-    if not rows:
-        return await m.answer("Kategoriyalar yo'q. /addcategory Nomi")
-    await m.answer("\n".join(f"{r['id']}. {r['name']}" for r in rows))
+    await m.answer(categories_text())
 
 
 @admin.message(Command("delcategory"))
@@ -280,10 +499,7 @@ async def del_category(m: Message):
 
 @admin.message(Command("books"))
 async def list_books(m: Message):
-    rows = q("SELECT id, title, lang FROM books ORDER BY id DESC LIMIT 50")
-    if not rows:
-        return await m.answer("Kitoblar yo'q. /addbook")
-    await m.answer("\n".join(f"{r['id']}. [{r['lang']}] {r['title']}" for r in rows))
+    await m.answer(books_text())
 
 
 @admin.message(Command("delbook"))
@@ -295,18 +511,17 @@ async def del_book(m: Message):
     await m.answer("🗑 O'chirildi.")
 
 
-@admin.message(Command("cancel"))
-async def cancel(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("Bekor qilindi.")
+# ---- Kitob qo'shish
+async def begin_addbook(msg: Message, state: FSMContext):
+    if not q("SELECT 1 FROM categories LIMIT 1", one=True):
+        return await msg.answer("Avval kategoriya qo'shing (panelda «Kategoriya qo'shish»).")
+    await state.set_state(AddBook.title)
+    await msg.answer("📖 Kitob nomini yuboring:")
 
 
 @admin.message(Command("addbook"))
 async def addbook_start(m: Message, state: FSMContext):
-    if not q("SELECT 1 FROM categories LIMIT 1", one=True):
-        return await m.answer("Avval kategoriya qo'shing: /addcategory Nomi")
-    await state.set_state(AddBook.title)
-    await m.answer("📖 Kitob nomini yuboring:")
+    await begin_addbook(m, state)
 
 
 @admin.message(AddBook.title, F.text)
@@ -372,8 +587,9 @@ async def main():
     init_db()
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(admin)
+    # Muhim: user router birinchi — pastki menyu tugmalari admin holatlaridan (state) ustun turadi
     dp.include_router(user)
+    dp.include_router(admin)
     await dp.start_polling(bot)
 
 

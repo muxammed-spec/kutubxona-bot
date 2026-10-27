@@ -159,7 +159,9 @@ def main_menu_kb(lang, uid):
     ]
     if uid in ADMINS:
         rows.append([KeyboardButton(text=b["admin"])])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+    # one_time_keyboard=True: tugma bosilgach menyu yig'iladi va yozish maydoni
+    # yonida ⠿ belgisi chiqadi; shu belgini bossangiz menyu qayta ochiladi.
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
 def categories_kb(lang):
